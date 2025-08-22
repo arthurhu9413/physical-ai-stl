@@ -1,0 +1,18 @@
+signal { bool hot; }
+
+space {
+  edges { real dist; }
+}
+
+domain boolean;
+
+formula nowhere_hot     = !(somewhere[0, 100](hot));
+formula quench          = globally(nowhere_hot);
+formula contain         = eventually(quench);
+formula contain_hotspot = contain;
+
+formula quench_for(real tau) =
+  globally[0, tau](nowhere_hot);
+
+formula contain_within(real deadline, real tau) =
+  eventually[0, deadline](globally[0, tau](nowhere_hot));

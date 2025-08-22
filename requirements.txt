@@ -1,0 +1,38 @@
+# physical-ai-stl - requirements.txt
+#
+# Goal: a CPU-friendly base environment that can (1) run the lightweight
+# demos/scripts, (2) generate plots, and (3) monitor STL/STREL specs.
+#
+# Install (recommended):
+#   python -m pip install --upgrade pip
+#   python -m pip install -r requirements.txt
+#
+# Notes
+# -----
+# * PyTorch is treated as an optional heavy dependency in this repo.
+#   If you want to run the PINN training experiments, install a CPU wheel:
+#     python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+#
+# * MoonLight (STREL) requires a working Java runtime at run time.
+#   If you see JVM errors, install a JRE/JDK (e.g., OpenJDK 17+) and ensure
+#   `java` is on your PATH.
+#
+# Keep versions loosely pinned (major-bounded) to stay reproducible while
+# remaining installable across common Python 3.10+ environments.
+
+# --- Core scientific stack (CPU) --------------------------------------------
+numpy>=1.24,<3.0
+PyYAML>=6.0,<7.0
+matplotlib>=3.7,<4.0
+packaging>=23.2,<26.0
+
+# --- Temporal & spatial monitoring ------------------------------------------
+# STL monitoring (offline/online robustness)
+rtamt>=0.3.5,<0.4
+
+# STREL / spatial monitoring (MoonLightSuite Python wrapper)
+moonlight>=0.3.1,<0.4
+
+# --- Lightweight test runner (recommended) ----------------------------------
+# This repo includes a small pytest suite with graceful skipping for optional deps.
+pytest>=7.4,<9.0

@@ -1,0 +1,87 @@
+# requirements-extra.txt
+# ----------------------
+# Full "demo + figures" dependency stack for this repository.
+#
+# This file is intentionally self-contained (i.e., it does NOT `-r requirements.txt`).
+# Rationale: it keeps the demo install path to a single command and avoids resolver
+# conflicts if the base file is pinned too tightly.
+#
+# Recommended usage:
+#   python -m pip install --upgrade pip
+#   python -m pip install -r requirements-extra.txt
+#
+# Non-pip prerequisites (needed for *some* demos):
+# - Java 21+ runtime on PATH (required by MoonLight STREL monitoring backend).
+# - (Optional, for automaton-based planning) MONA: https://www.brics.dk/mona/
+#   `ltlf2dfa` calls MONA; this is why spatial tooling is disabled on Windows.
+#
+# PhysicsNeMo note:
+# - If your environment cannot resolve PhysicsNeMo wheels from PyPI, rerun with NVIDIA's index enabled:
+#     python -m pip install --extra-index-url https://pypi.nvidia.com -r requirements-extra.txt
+
+# -----------------------------------------------------------------------------
+# Core runtime + plotting + monitoring
+# -----------------------------------------------------------------------------
+# Keep NumPy <2.0 for broad compatibility with scientific/PINN stacks.
+numpy>=1.24,<2.0
+pyyaml>=6.0
+matplotlib>=3.6,<4.0
+packaging>=23.0
+pillow>=10.0.0
+
+# STL monitoring (offline/online robustness)
+rtamt==0.3.5
+
+# STREL / spatial monitoring (Python wrapper around MoonLight Java backend)
+# NOTE: Latest PyPI release is 0.3.1 (0.3.x API).
+moonlight>=0.3.1,<0.4
+
+# -----------------------------------------------------------------------------
+# PyTorch stack
+# -----------------------------------------------------------------------------
+# NOTE: `pip install torch` from PyPI installs CPU builds.
+# For CUDA builds, follow the official selector: https://pytorch.org/get-started/locally/
+torch>=2.2,<3.0
+
+# -----------------------------------------------------------------------------
+# Physical-AI frameworks
+# -----------------------------------------------------------------------------
+# Neuromancer (PNNL) – differentiable optimization/control + physics ML
+neuromancer>=1.5.0,<2.0
+
+# Bosch TorchPhysics – PINNs/DeepRitz library
+torchphysics>=1.0.0,<2.0
+pytorch-lightning>=2.0,<3.0
+
+# NVIDIA PhysicsNeMo – multi-physics ML framework (Linux-first)
+# Core package is on PyPI; keep behind a Linux marker for lowest-friction installs.
+nvidia-physicsnemo>=1.3.0,<2.0 ; platform_system == "Linux" and python_version >= "3.10"
+
+# Optional PhysicsNeMo extensions (often require CUDA/toolchain; install only if needed):
+# nvidia-physicsnemo-sym ; platform_system == "Linux" and python_version >= "3.10"
+# nvidia-physicsnemo-cfd ; platform_system == "Linux" and python_version >= "3.10"
+# nvidia-physicsnemo-curator ; platform_system == "Linux" and python_version >= "3.10"
+
+# -----------------------------------------------------------------------------
+# Spatial / spatio-temporal STL tooling
+# -----------------------------------------------------------------------------
+# Spatial-Spec (PyPI dist: spatial-spec; import: spatial_spec)
+spatial-spec>=0.1.1,<0.2 ; platform_system != "Windows"
+
+# LTLf2DFA bridge to MONA (automata-based planning)
+ltlf2dfa==1.0.2 ; platform_system != "Windows"
+
+# SpaTiaL reference implementation (provides the `spatial` module)
+# NOTE: requires `git` on your PATH.
+spatial @ git+https://github.com/KTH-RPL-Planiacs/SpaTiaL.git#subdirectory=spatial-lib ; platform_system != "Windows"
+
+# SpaTiaL runtime deps
+shapely>=2.0 ; platform_system != "Windows"
+lark>=1.1.0 ; platform_system != "Windows"
+
+# -----------------------------------------------------------------------------
+# Reproducibility / profiling utilities
+# -----------------------------------------------------------------------------
+# Useful for reporting CPU/GPU/RAM and timing (for report/paper writeups).
+psutil>=5.9
+py-cpuinfo>=9.0.0

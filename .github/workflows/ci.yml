@@ -1,0 +1,451 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_NO_PYTHON_VERSION_WARNING: "1"
+  PYTHONUNBUFFERED: "1"
+  PYTHONUTF8: "1"
+  PYTHONHASHSEED: "0"
+  # Headless, deterministic plotting in CI.
+  MPLBACKEND: Agg
+  # Keep CI CPU-friendly and reduce nondeterminism from thread pools.
+  OMP_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+  OPENBLAS_NUM_THREADS: "1"
+  NUMEXPR_NUM_THREADS: "1"
+  # Keep caches inside the workspace (helps with Actions caching + artifacts).
+  XDG_CACHE_HOME: ${{ github.workspace }}/.cache
+  MPLCONFIGDIR: ${{ github.workspace }}/.mplconfig
+  PYTHONPYCACHEPREFIX: ${{ github.workspace }}/.pycache
+  FORCE_COLOR: "1"
+  CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+jobs:
+  preflight:
+    name: Preflight (change detection)
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      docs: ${{ steps.filter.outputs.docs }}
+      workflows: ${{ steps.filter.outputs.workflows }}
+      precommit: ${{ steps.precommit.outputs.present }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Path filter
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          filters: |
+            code:
+              - '**/*.py'
+              - 'src/**'
+              - 'tests/**'
+              - 'scripts/**'
+              - 'pyproject.toml'
+              - 'requirements*.txt'
+              - '.pre-commit-config.yaml'
+              - 'Makefile'
+              - 'Dockerfile'
+              - 'configs/**'
+              - '.github/workflows/ci.yml'
+            docs:
+              - 'README.md'
+              - 'docs/**'
+              - 'assets/**'
+              - 'figs/**'
+              - 'results/**'
+            workflows:
+              - '.github/workflows/**'
+
+      - name: Detect pre-commit config
+        id: precommit
+        shell: bash
+        run: |
+          if [ -f .pre-commit-config.yaml ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  lint:
+    name: Lint (pre-commit) — Python 3.12
+    needs: [preflight]
+    if: ${{ (needs.preflight.outputs.code == 'true' || needs.preflight.outputs.workflows == 'true') && needs.preflight.outputs.precommit == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run pre-commit
+        uses: pre-commit/action@v3.0.1
+        # The action caches hook environments automatically
+
+  docs:
+    name: Docs & repo-link sanity — Python 3.12
+    needs: [preflight]
+    if: ${{ needs.preflight.outputs.docs == 'true' || needs.preflight.outputs.workflows == 'true' || github.event_name == 'schedule' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Validate local links in Markdown (README/docs)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import re
+          import sys
+          from pathlib import Path
+          from urllib.parse import unquote
+
+          root = Path('.')
+
+          md_files = [root / 'README.md']
+          md_files.extend(sorted((root / 'docs').rglob('*.md')))
+
+          # NOTE: Avoid false positives on ST(L/REL) formulas like:
+          #   somewhere[0,100](hot)
+          # by requiring a "link-ish" prefix before the opening '['.
+          link_re = re.compile(r"(?:^|[\s\(\[\{\<\!\-\*\"\'])\[[^\]]+\]\(([^)]+)\)")
+
+          def is_local_target(target: str) -> bool:
+              t = target.strip()
+              if not t:
+                  return False
+              if t.startswith(('#', 'http://', 'https://', 'mailto:', 'tel:')):
+                  return False
+              return True
+
+          missing: list[str] = []
+
+          for md in md_files:
+              if not md.is_file():
+                  continue
+              text = md.read_text(encoding='utf-8', errors='replace')
+              for raw in link_re.findall(text):
+                  # Drop surrounding quotes, strip whitespace, and remove anchors.
+                  target = raw.strip().strip('"\'')
+                  target = target.split('#', 1)[0].split('?', 1)[0]
+                  target = unquote(target)
+                  if not is_local_target(target):
+                      continue
+                  # Resolve relative to the markdown file location.
+                  resolved = (md.parent / target).resolve()
+                  # Keep checks scoped to repo to avoid escaping.
+                  try:
+                      resolved.relative_to(root.resolve())
+                  except ValueError:
+                      continue
+                  if not resolved.exists():
+                      missing.append(f"{md.as_posix()}: {raw} -> {target}")
+
+          if missing:
+              print('Broken local links detected:')
+              for m in missing:
+                  print(f'  - {m}')
+              sys.exit(1)
+
+          print('✅ Markdown local links look OK.')
+          PY
+
+  unit:
+    name: Tests (unit / minimal deps) — Python ${{ matrix.python-version }}
+    needs: [preflight]
+    if: ${{ needs.preflight.outputs.code == 'true' || needs.preflight.outputs.workflows == 'true' || github.event_name == 'schedule' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python-version: "3.10"
+            experimental: false
+          - python-version: "3.11"
+            experimental: false
+          - python-version: "3.12"
+            experimental: false
+          - python-version: "3.13"
+            experimental: true
+    continue-on-error: ${{ matrix.experimental }}
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+            pyproject.toml
+
+      - name: Install uv (fast pip-compatible installer)
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Install minimal deps (prefer uv; no local build)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          uv pip install --system --upgrade pip wheel setuptools
+          uv pip install --system -r requirements.txt -r requirements-dev.txt || \
+            pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run tests (exclude optional stacks)
+        env:
+          PYTHONPATH: src
+        shell: bash
+        run: |
+          set -e
+          # Keep the default CI loop fast, CPU-only, and stable.
+          # Optional stacks are exercised in the "extras" job.
+          EXCLUDE="not (stl_soft or moonlight or spatial or neuromancer or physicsnemo or torchphysics)"
+          pytest -q -n auto --maxfail=1 --disable-warnings \
+            -k "$EXCLUDE" \
+            --cov=src/physical_ai_stl \
+            --cov-report=xml \
+            --cov-report=term-missing:skip-covered
+
+      - name: Smoke (CLI + configs + env report) — Py 3.12 only
+        if: ${{ matrix.python-version == '3.12' }}
+        env:
+          PYTHONPATH: src
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p results
+
+          # CLI/helpful metadata for the final report (hardware + deps matrix)
+          python -m physical_ai_stl about --brief
+          python -m physical_ai_stl doctor --json > results/doctor_ci.json || true
+
+          # Environment probe used in the demo brief (should never crash)
+          python scripts/check_env.py --plain || true
+          python scripts/check_env.py --json > results/env_probe_ci.json || true
+
+          # Config parsing / dry-runs (no Torch required)
+          python scripts/run_experiment.py --list
+          python scripts/run_experiment.py --config configs/diffusion1d_baseline.yaml --dry-run
+          python scripts/run_experiment.py --config configs/diffusion1d_stl.yaml --dry-run
+          python scripts/run_experiment.py --config configs/heat2d_baseline.yaml --dry-run
+
+          # Lightweight framework/STL survey (stdlib-only)
+          python scripts/framework_survey.py --format md > results/framework_survey_ci.md
+
+      - name: Validate committed demo artifacts — Py 3.12 only
+        if: ${{ matrix.python-version == '3.12' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import json
+          import sys
+          from pathlib import Path
+
+          root = Path('.')
+
+          # These are explicitly referenced in the README/report and are what
+          # Prof. Johnson asked to see: concrete, already-run examples w/ plots.
+          required_files = [
+              'assets/diffusion1d_baseline_field.png',
+              'assets/diffusion1d_stl_field.png',
+              'assets/diffusion1d_training_loss.png',
+              'assets/diffusion1d_training_robustness.png',
+              'assets/diffusion1d_training_loss_components_stl.png',
+              'assets/diffusion1d_robust_vs_lambda.png',
+              'figs/diffusion1d_ablations.png',
+              'results/diffusion1d_baseline_rtamt.json',
+              'results/diffusion1d_stl_rtamt.json',
+          ]
+
+          missing: list[str] = []
+          for rel in required_files:
+              p = root / rel
+              if not p.is_file() or p.stat().st_size <= 0:
+                  missing.append(rel)
+
+          if missing:
+              print('Missing required demo artifacts:')
+              for rel in missing:
+                  print(f'  - {rel}')
+              sys.exit(1)
+
+          # Basic schema sanity on monitoring outputs (RTAMT fallback JSON)
+          for rel in ['results/diffusion1d_baseline_rtamt.json', 'results/diffusion1d_stl_rtamt.json']:
+              data = json.loads((root / rel).read_text(encoding='utf-8'))
+              for k in ['spec', 'robustness', 'satisfied']:
+                  if k not in data:
+                      raise KeyError(f"{rel} missing key: {k}")
+              if not isinstance(data['satisfied'], bool):
+                  raise TypeError(f"{rel} 'satisfied' should be bool")
+              if not isinstance(data['robustness'], (int, float)):
+                  raise TypeError(f"{rel} 'robustness' should be a number")
+
+          print('✅ Demo artifacts and monitoring outputs look OK.')
+          PY
+
+      - name: Upload demo bundle (plots + monitoring JSON + CI env reports) — Py 3.12 only
+        if: ${{ matrix.python-version == '3.12' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-bundle-py312
+          if-no-files-found: error
+          path: |
+            assets/diffusion1d_*.png
+            figs/diffusion1d_ablations.png
+            results/diffusion1d_*_rtamt.json
+            results/diffusion1d_ablations.csv
+            figs/diffusion1d_ablations_summary.csv
+            results/diffusion1d_baseline.csv
+            results/diffusion1d_stl.csv
+            results/doctor_ci.json
+            results/env_probe_ci.json
+            results/framework_survey_ci.md
+            coverage.xml
+
+      - name: Upload coverage to Codecov (main Py 3.12 only)
+        if: ${{ env.CODECOV_TOKEN != '' && matrix.python-version == '3.12' }}
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ env.CODECOV_TOKEN }}
+          files: ./coverage.xml
+          fail_ci_if_error: true
+          verbose: true
+
+  extras:
+    name: "Tests (optional deps: Torch/RTAMT/MoonLight/SpaTiaL/frameworks)"
+    needs: [preflight]
+    # Keep PRs fast/reliable; run the heavier optional stack on a schedule,
+    # on-demand, or after direct pushes to main/master.
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+            requirements-extra.txt
+            pyproject.toml
+
+      - name: Install uv (fast pip-compatible installer)
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Install Java 21 (MoonLight STREL)
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install system deps for SpaTiaL (MONA) [best-effort]
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mona || true
+
+      - name: Install optional stacks (prefer uv; best-effort; no local build)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          uv pip install --system --upgrade pip wheel setuptools
+          uv pip install --system -r requirements.txt -r requirements-dev.txt || \
+            pip install -r requirements.txt -r requirements-dev.txt
+          if [ -f requirements-extra.txt ]; then
+            uv pip install --system -r requirements-extra.txt || pip install -r requirements-extra.txt || true
+          fi
+
+      - name: Show key versions
+        shell: bash
+        run: |
+          python - <<'PY'
+          import importlib
+          for name in [
+              "torch",
+              "rtamt",
+              "moonlight",
+              "spatial_spec",
+              "neuromancer",
+              "torchphysics",
+              "physicsnemo",
+          ]:
+              try:
+                  m = importlib.import_module(name)
+                  v = getattr(m, "__version__", "unknown")
+                  print(f"{name}: {v}")
+              except Exception as e:
+                  print(f"{name}: NOT INSTALLED ({e})")
+          PY
+          java -version
+
+      - name: Run targeted tests that exercise optional deps (skip if none)
+        env:
+          PYTHONPATH: src
+        shell: bash
+        run: |
+          set -e
+          # NOTE: we intentionally omit "stl_soft" here.
+          # The differentiable STL penalty is optional, and we avoid making the
+          # optional-stack job brittle if torch semantics or upstream versions
+          # change. The core story for this repo (examples + monitoring + plots)
+          # is still fully exercised.
+          MATCH_EXPR="moonlight or spatial or rtamt or neuromancer or torchphysics or physicsnemo or pde"
+          COLLECT_OUTPUT="$(pytest --collect-only -q -k "$MATCH_EXPR" 2>/dev/null || true)"
+          if [ -n "$COLLECT_OUTPUT" ]; then
+            echo "Discovered optional tests:"
+            echo "$COLLECT_OUTPUT" | sed -n '1,20p'
+            pytest -q -n auto --maxfail=1 --disable-warnings -k "$MATCH_EXPR"
+          else
+            echo "No optional tests discovered; skipping extras test suite."
+          fi

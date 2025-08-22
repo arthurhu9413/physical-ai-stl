@@ -1,0 +1,2 @@
+series,metric,higher_is_better,best_x,best_y,num_points,avg_n_repeats
+1d,y,True,10.0,0.2950578033924103,6,1.0

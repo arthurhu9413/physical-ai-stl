@@ -1,0 +1,242 @@
+---
+# =============================================================================
+# Heat2D PINN — baseline + STL/STREL audit hooks (report‑ready)
+# =============================================================================
+# Experiment runner:
+#   src/physical_ai_stl/experiments/heat2d.py
+#
+# Run (default):
+#   python scripts/run_experiment.py -c configs/heat2d_baseline.yaml
+#
+# Quick CPU smoke (keeps artifacts small):
+#   python scripts/run_experiment.py -c configs/heat2d_baseline.yaml \
+#     --set optim.epochs=50 --set io.save_ckpt=false --set io.save_grads=false
+#
+# -----------------------------------------------------------------------------
+# Physical problem (2‑D heat / diffusion)
+# -----------------------------------------------------------------------------
+# We learn a temperature field u(x,y,t) on Ω=[0,1]×[0,1], t∈[0,1] governed by:
+#
+#   u_t(x,y,t) = α (u_xx(x,y,t) + u_yy(x,y,t))
+#
+# with homogeneous Dirichlet boundary conditions (u=0 on ∂Ω) and a Gaussian
+# hotspot initial condition at t=0 (see src/physical_ai_stl/physics/heat2d.py).
+#
+# -----------------------------------------------------------------------------
+# What gets saved (useful for the final report + presentation)
+# -----------------------------------------------------------------------------
+# scripts/run_experiment.py creates a unique run directory:
+#   results/<experiment>--<tag>--<timestamp>/
+# and writes:
+#   - config.effective.yaml         (the exact config after --set overrides)
+#   - env.json                      (hardware + torch/cuda info; cite in report)
+#   - metrics.json                  (wall‑clock runtime; use for cost comparisons)
+#   - heat2d_<tag>.csv              (loss curves: pde / bc+ic / stl)
+#   - heat2d_<tag>_field.pt         (dense rollout u(x,y,t) + X,Y,T grid tensors)
+#   - heat2d_<tag>_frame_*.npy/png  (optional snapshots for figures)
+#
+# -----------------------------------------------------------------------------
+# STL / spatial‑STL requirements from Prof. Johnson
+# -----------------------------------------------------------------------------
+# • λ (lambda) in slides/paper = stl.weight below.
+# • The trained model output is the PINN u(x,y,t).
+# • Spatial quantification is approximated by sampling a grid:
+#     - training grid:     grid.n_x × grid.n_y × grid.n_t
+#     - STL monitor grid:  stl.n_x  × stl.n_y  × stl.n_t   (coarser, cheaper)
+# • For spatial STL variants (STREL), audit the saved rollout with MoonLight.
+#   A ready‑to‑run containment/quenching spec lives at:
+#     scripts/specs/contain_hotspot.mls
+#
+# -----------------------------------------------------------------------------
+# High‑level data flow (ASCII block diagram)
+# -----------------------------------------------------------------------------
+#   (PDE + IC/BC) + (PINN architecture) + (specs, optional)
+#              │
+#              ▼
+#        training loop  ───────────────► trained PINN û(x,y,t)
+#              │                               │
+#              │ (exports)                      │ (audit/monitor)
+#              ▼                               ▼
+#   saved rollout + figures            STL penalty / STREL robustness
+#
+# =============================================================================
+
+experiment: heat2d
+tag: baseline
+seed: 0
+
+# ---------------------------------------------------------------------------
+# Neural field model (PINN)
+# ---------------------------------------------------------------------------
+model:
+  # Deeper/wider than the tiny demo models; this is meant to be “paper‑quality”
+  # by default. For fast demos: set hidden to [64,64,64] via --set.
+  hidden: [128, 128, 128, 128]
+  activation: tanh
+  out_activation: null
+
+# ---------------------------------------------------------------------------
+# Space–time grid used for sampling/exports (not the per‑step batch size)
+# ---------------------------------------------------------------------------
+grid:
+  n_x: 64
+  n_y: 64
+  n_t: 64
+  x_min: 0.0
+  x_max: 1.0
+  y_min: 0.0
+  y_max: 1.0
+  t_min: 0.0
+  t_max: 1.0
+
+# ---------------------------------------------------------------------------
+# Optimization / runtime
+# ---------------------------------------------------------------------------
+optim:
+  lr: 1.0e-3
+  epochs: 2000
+  batch: 8192
+  weight_decay: 0.0
+  amsgrad: false
+  scheduler: cosine        # 'none' | 'cosine' | 'step'
+  step_size: 500           # used only if scheduler: step
+  gamma: 0.5               # used only if scheduler: step
+  grad_clip: 1.0           # helps stability for higher‑order autograd
+  compile: true            # best‑effort torch.compile (safe fallback if unsupported)
+  amp: false               # AMP off by default (2nd‑order grads can be sensitive)
+  device: auto             # 'auto' → cuda→mps→cpu
+  dtype: float32           # fp32 improves stability for PDE residuals
+
+# ---------------------------------------------------------------------------
+# Physics terms (PDE residual + BC/IC sampling)
+# ---------------------------------------------------------------------------
+physics:
+  alpha: 0.1               # diffusivity
+  bcic_weight: 10.0        # weight for boundary/IC penalties
+  n_boundary: 1024         # samples per step for boundary loss
+  n_initial: 2048          # samples per step for initial condition loss
+
+  # If >0, multiplies the network output by a boundary mask^pow so u=0 on ∂Ω
+  # is satisfied *exactly* (hard BC). This is a good “report‑grade” default.
+  use_dirichlet_mask_pow: 2
+
+# ---------------------------------------------------------------------------
+# Residual‑aware resampling (RAR)
+# ---------------------------------------------------------------------------
+# RAR can help PINNs satisfy the PDE in “difficult” regions without hand‑tuning.
+# Keep disabled for the cleanest baseline; enable for stronger paper results.
+rar:
+  pool: 0                  # set >0 to enable (e.g., 8192 or 16384)
+  hard_frac: 0.25          # fraction of each batch taken from highest‑|residual| pool points
+  every: 25                # apply RAR every N epochs when pool>0
+  topk: 0                  # optional: override hard_frac with an absolute count
+
+# ---------------------------------------------------------------------------
+# Differentiable STL penalty (internal soft semantics)
+# ---------------------------------------------------------------------------
+# Baseline = stl.use: false.
+# To run a genuine STL‑regularized variant, flip stl.use=true and pick a spec.
+#
+# Spec templates (as written in the paper/slides):
+#
+#  (A) Safety bound (everywhere, always):
+#      □_[0,T]  ∀_{(x,y)∈Ω}  u(x,y,t) ≤ Umax
+#      → stl.operator=always, stl.space_op=forall, stl.u_max=Umax
+#
+#  (B) Cooling / quench by a deadline (everywhere, eventually):
+#      ◇_[t0,T]  ∀_{(x,y)∈Ω}  u(x,y,t) ≤ Ucool
+#      → stl.operator=eventually, stl.t_min=t0, stl.u_max=Ucool
+#
+#  (C) Cooling at a particular location/region (center patch):
+#      ◇_[t0,T]  ∀_{(x,y)∈patch}  u(x,y,t) ≤ Ucool
+#      → additionally set stl.x_min/x_max, stl.y_min/y_max to a small window.
+#
+# Notes:
+# • λ (lambda) = stl.weight. In the training loop we add:
+#     loss_total = loss_pde + bcic_weight*loss_bcic + λ*penalty(robustness)
+# • The STL evaluation uses its *own* coarse monitor grid (stl.n_x/n_y/n_t).
+stl:
+  use: false               # flip true for STL‑regularized training
+
+  # λ (lambda) — scales the STL penalty term
+  weight: 10.0
+
+  # Predicate bounds (pick u_max and/or u_min)
+  u_min: null
+  u_max: 0.1               # “cool” threshold used in (B)/(C) above
+
+  # Penalty/robustness shaping
+  margin: 0.0              # desire robustness ≥ margin
+  beta: 10.0               # softplus sharpness
+  temp: 0.1                # temperature for temporal soft min/max
+  space_op: forall         # 'forall' (softmin) | 'exists' (softmax)
+  space_temp: 0.1          # temperature for spatial soft min/max
+
+  # Temporal operator
+  operator: eventually     # 'always' (□) | 'eventually' (◇)
+  window: 0                # window length in samples (0 ⇒ whole horizon)
+  stride: 1                # window stride in samples
+  every: 25                # evaluate/add penalty every N epochs
+
+  # Coarse monitor grid (decoupled from training grid)
+  n_x: 32
+  n_y: 32
+  n_t: 33
+
+  # Optional STL subregion (defaults to the whole domain)
+  x_min: null
+  x_max: null
+  y_min: null
+  y_max: null
+
+  # “After t0” specs: restrict the monitored time range
+  t_min: 0.5
+  t_max: 1.0
+
+# ---------------------------------------------------------------------------
+# Output / logging
+# ---------------------------------------------------------------------------
+io:
+  results_dir: results
+  save_every: 250
+  save_ckpt: true
+  save_field: true
+
+  # Figures / plots (for report & slides)
+  save_frames: true
+  frames_idx: [0, 16, 32, 48, 63]   # time indices to export (must be within [0, n_t-1])
+  save_grads: true                  # saves ∥∇u∥ snapshots (helpful for “what changed?”)
+  save_figs: true
+  print_every: 25
+
+# ---------------------------------------------------------------------------
+# STREL / MoonLight audit (spatial STL variant) — **not consumed by the trainer**
+# ---------------------------------------------------------------------------
+# This is a “living note” block so the final report can be reproduced from
+# this single config. The experiment runner ignores this section.
+#
+# 1) Convert the saved rollout to a single .npy (shape: nx×ny×nt):
+#
+#   python - <<'PY'
+#   import numpy as np, torch
+#   d = torch.load('PATH/TO/heat2d_<tag>_field.pt', map_location='cpu')
+#   np.save('field_xy_t.npy', d['u'].numpy())
+#   print('saved field_xy_t.npy', d['u'].shape)
+#   PY
+#
+# 2) Evaluate a STREL containment/quenching spec with MoonLight:
+#
+#   python scripts/eval_heat2d_moonlight.py \
+#     --field field_xy_t.npy --layout xy_t --mls scripts/specs/contain_hotspot.mls \
+#     --formula "contain_within(0.75, 0.25)" --binarize --threshold 0.25
+#
+# Interpretation:
+#   hot := (u ≥ threshold)
+#   contain_within(deadline, tau):
+#     “Within 'deadline' time, the hotspot is quenched and stays quenched for 'tau' time.”
+strel_audit:
+  mls: scripts/specs/contain_hotspot.mls
+  formula: contain_within(0.75, 0.25)
+  binarize: true
+  threshold: 0.25
+  adj_weight: 1.0          # 1.0 = graph hop distance; set to dx for physical distance

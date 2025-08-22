@@ -1,0 +1,144 @@
+---
+# =============================================================================
+# Diffusion1D PINN — Baseline (monitor-only STL, CPU-friendly, reproducible)
+# =============================================================================
+# This config is intentionally *professor-friendly*:
+#   • Clearly states the physical problem (PDE + IC/BC) and what u(x,t) means.
+#   • Produces a trained PINN + saved u(x,t) field tensor for plotting/auditing.
+#   • Computes/logs STL robustness each epoch (baseline = λ=0), so we can report:
+#       - what spec was monitored,
+#       - whether it was falsified,
+#       - robustness curves over training.
+#
+# Experiment runner: src/physical_ai_stl/experiments/diffusion1d.py
+# Run:  python scripts/run_experiment.py -c configs/diffusion1d_baseline.yaml
+# Quick CPU smoke (override):  python scripts/run_experiment.py -c configs/diffusion1d_baseline.yaml --set optim.epochs=50
+#
+# -----------------------------------------------------------------------------
+# Problem definition (documentation-only; the code uses the same defaults)
+# -----------------------------------------------------------------------------
+# PDE (1D heat/diffusion):
+#   u_t(x,t) = α · u_xx(x,t),     x ∈ [0,1], t ∈ [0,1]
+#
+# Interpretation:
+#   u(x,t) is a scalar field (e.g., temperature) at spatial location x and time t.
+#
+# Boundary conditions (Dirichlet, homogeneous):
+#   u(0,t) = 0,  u(1,t) = 0
+#
+# Initial condition (sine mode, matches src/physical_ai_stl/physics/diffusion1d.py):
+#   u(x,0) = sin(πx)
+#
+# Closed-form solution (for reference / sanity checks):
+#   u(x,t) = exp(-απ²t) · sin(πx)
+#
+# -----------------------------------------------------------------------------
+# STL monitoring philosophy for this baseline
+# -----------------------------------------------------------------------------
+# We enable the internal differentiable STL monitor so robustness is computed and
+# logged, *but* we set λ = 0 so the STL term does not affect training.
+# This makes the baseline a clean “physics-only” PINN while still being auditable.
+#
+# Main monitored spec (as implemented in diffusion1d.py):
+#   φ_bound :=  G_[0,1] (  max_{x∈[0,1]} u(x,t)  ≤  U_max )
+#
+# Discretization note:
+#   The ∀x / max_x is approximated on a *finite* spatial grid (stl.n_x points),
+#   and the temporal G operator is evaluated on stl.n_t points over [0,1].
+#   This is the approximation we should be explicit about in the report/slides.
+#
+# Additional recommended *evaluation* specs (RTAMT syntax; see scripts/eval_diffusion_rtamt.py):
+#   s(t) := max_x u(x,t)   (spatially reduced scalar)
+#     1) always upper bound:     always[0,1](s <= 1.0)
+#     2) eventual “cooling” goal: eventually[0.5,1](s <= 0.2)
+#
+# =============================================================================
+
+experiment: diffusion1d
+tag: baseline
+seed: 0
+
+# ---------------------------------------------------------------------------
+# Neural field model (compact MLP; stable for parabolic PDEs)
+# ---------------------------------------------------------------------------
+model:
+  hidden: [64, 64, 64]       # three-layer MLP; strong accuracy/latency tradeoff
+  activation: tanh           # robust default for PINNs on diffusion-type PDEs
+  # out_activation: null      # (optional) output clamp; keep off for unbiased physics fit
+
+# ---------------------------------------------------------------------------
+# Export grid (used only for saving the final u(x,t) field for plots/auditing)
+# NOTE: This does NOT change the training batch size.
+# ---------------------------------------------------------------------------
+grid:
+  n_x: 256                   # higher resolution -> cleaner heatmap/field plots
+  n_t: 128                   # more temporal slices for smoother visualizations
+  x_min: 0.0
+  x_max: 1.0
+  t_min: 0.0
+  t_max: 1.0
+
+# ---------------------------------------------------------------------------
+# Physics parameters
+# ---------------------------------------------------------------------------
+physics:
+  alpha: 0.1                 # diffusion coefficient α
+
+# ---------------------------------------------------------------------------
+# Optimization & collocation sampling
+# ---------------------------------------------------------------------------
+optim:
+  lr: 2.0e-3                 # Adam lr; stable for this model size
+  epochs: 400                # baseline budget (reasonably fast on CPU; reproducible)
+  batch: 4096                # interior collocation points per step
+  weight_decay: 0.0
+  n_boundary: 256            # samples along x={0,1} over t∈[0,1]
+  n_initial: 512             # samples along t=0 over x∈[0,1]
+  sample_method: sobol       # low-discrepancy sampling for better coverage
+
+# ---------------------------------------------------------------------------
+# STL monitoring / (optional) enforcement
+# ---------------------------------------------------------------------------
+stl:
+  # Baseline = monitor-only: compute robustness, but do NOT regularize training.
+  use: true                  # must be true to log robustness each epoch
+  weight: 0.0                # λ = 0  → physics-only baseline (no STL loss influence)
+
+  # Predicate / spec parameters (φ_bound)
+  u_max: 1.0                 # U_max (tighten to show falsification more easily)
+  temp: 0.1                  # temperature for soft temporal aggregators (G via soft-min)
+  spatial: amax              # reduce_x: "mean" | "softmax" | "amax" (amax = worst-case)
+
+  # Monitoring cadence + discretization grid for (x,t) when evaluating robustness
+  every: 1                   # compute robustness every k epochs (k ≥ 1)
+  n_x: 64                    # spatial samples used for robustness (approximates max_x)
+  n_t: 64                    # temporal samples used for robustness (approximates G over [0,1])
+
+  # Documentation-only convenience: RTAMT-ready specs to evaluate on saved fields
+  eval_specs:
+    # RTAMT variable name in scripts/eval_diffusion_rtamt.py is s (scalar time series).
+    # Here we assume s(t) = max_x u(x,t) via --agg amax.
+    always_upper:
+      description: "Safety: amplitude never exceeds U_max over the horizon."
+      rtamt: "always[0,1](s <= 1.0)"
+      agg: amax
+    eventually_cool:
+      description: "Liveness-style cooling: by t>=0.5 the max temperature drops below 0.2."
+      rtamt: "eventually[0.5,1](s <= 0.2)"
+      agg: amax
+
+# ---------------------------------------------------------------------------
+# System / runtime
+# ---------------------------------------------------------------------------
+device: null                 # null => auto (cuda -> mps -> cpu)
+dtype: float32               # higher-order derivatives more stable in fp32
+amp: false                   # AMP off by default for PINN stability
+compile: false               # torch.compile can speed up on PyTorch 2.x; keep off for portability
+print_every: 25
+
+# ---------------------------------------------------------------------------
+# Output / artifacts
+# ---------------------------------------------------------------------------
+io:
+  results_dir: results       # artifacts: csv log, ckpt, final field tensor
+  save_ckpt: true

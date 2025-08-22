@@ -1,0 +1,44 @@
+experiment: diffusion1d
+tag: baseline
+seed: 0
+model:
+  hidden:
+  - 64
+  - 64
+  - 64
+  activation: tanh
+grid:
+  n_x: 128
+  n_t: 64
+  x_min: 0.0
+  x_max: 1.0
+  t_min: 0.0
+  t_max: 1.0
+physics:
+  alpha: 0.1
+optim:
+  lr: 0.002
+  epochs: 400
+  batch: 4096
+  weight_decay: 0.0
+  n_boundary: 256
+  n_initial: 512
+  sample_method: sobol
+stl:
+  use: false
+  weight: 0.0
+  u_max: 1.0
+  temp: 0.1
+  spatial: amax
+  every: 1
+  n_x: 64
+  n_t: 64
+device: null
+dtype: float32
+amp: false
+compile: false
+print_every: 25
+io:
+  results_dir: results
+  save_ckpt: true
+  run_dir: results\diffusion1d--baseline--20251117-164754-066122

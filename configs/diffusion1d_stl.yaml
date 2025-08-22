@@ -1,0 +1,188 @@
+---
+# =============================================================================
+# Diffusion1D PINN — STL-regularized (CPU-friendly, reproducible, report-ready)
+# =============================================================================
+# Experiment runner: src/physical_ai_stl/experiments/diffusion1d.py
+#
+# Run (full):         python scripts/run_experiment.py -c configs/diffusion1d_stl.yaml
+# Quick CPU smoke:    python scripts/run_experiment.py -c configs/diffusion1d_stl.yaml --set optim.epochs=50
+# (Compat alias)      python scripts/run_experiment.py -c configs/diffusion1d_stl.yaml --set training.epochs=50
+#
+# -----------------------------------------------------------------------------
+# Physical problem (1D heat / diffusion)
+# -----------------------------------------------------------------------------
+# We model a 1D temperature field u(x,t) on x∈[0,1], t∈[0,1] with:
+#
+#   u_t(x,t) = α u_xx(x,t)
+#
+# Boundary conditions (Dirichlet, homogeneous):
+#   u(0,t) = 0,   u(1,t) = 0
+#
+# Initial condition (sine mode; matches src/physical_ai_stl/physics/diffusion1d.py):
+#   u(x,0) = sin(πx)
+#
+# Closed-form solution (for reference / sanity checks):
+#   u(x,t) = exp(-απ²t) · sin(πx)
+#
+# -----------------------------------------------------------------------------
+# High-level dataflow (what connects to what)
+# -----------------------------------------------------------------------------
+#   PDE + IC/BC  ──► collocation sampler ──► PINN u_θ(x,t)
+#                                         │
+#                                         ├─► physics loss (PDE residual + IC/BC)
+#                                         │
+#                                         └─► STL monitor ρ_φ(u_θ) ──► STL penalty L_STL
+#                                                    (robustness)          (softplus)
+# Total loss:
+#   L_total = L_phys + λ · L_STL
+#
+# Here λ is the STL regularization weight `stl.weight` in this YAML.
+#
+# Outputs (saved artifacts):
+#   • CSV log:  diffusion1d_<tag>.csv  (losses + robustness per epoch)
+#   • Checkpoint: diffusion1d_<tag>.pt
+#   • Final field tensor: diffusion1d_<tag>_field.pt  (u on a dense (x,t) grid)
+#   • Run metadata (from run_experiment.py): results/diffusion1d--<tag>--<ts>/{env.json,metrics.json,...}
+#
+# -----------------------------------------------------------------------------
+# STL spec used *in training* (implemented in diffusion1d.py)
+# -----------------------------------------------------------------------------
+# Safety-style upper bound on peak temperature:
+#
+#   φ_bound :=  G_[0,1] (  max_{x∈[0,1]} u(x,t)  ≤  U_max )
+#
+# Discretization note (important for slides/paper):
+#   • The spatial max_{x∈[0,1]} is approximated on a finite grid of `stl.n_x` points.
+#   • The temporal G_[0,1] is evaluated on `stl.n_t` time samples over [0,1].
+#   • During training we use a differentiable spatial aggregator (softmax) and a
+#     differentiable temporal aggregator (soft-min) with temperature `stl.temp`.
+#
+# -----------------------------------------------------------------------------
+# Extra STL specs (evaluation / monitoring; RTAMT syntax)
+# -----------------------------------------------------------------------------
+# These are NOT currently used in the internal training loop (which only enforces φ_bound),
+# but are included here so the report can directly cite the exact formulas.
+# See: scripts/eval_diffusion_rtamt.py
+#
+# Tip for the report:
+#   Use s(t) := max_x u(x,t) (agg = amax) as a scalar time series, then run RTAMT on s(t).
+#
+# =============================================================================
+# Configuration
+# =============================================================================
+
+experiment: diffusion1d
+tag: stl
+
+# ---------------------------
+# Physics / domain parameters
+# ---------------------------
+physics:
+  alpha: 0.1                   # diffusion coefficient α
+grid:
+  x_min: 0.0
+  x_max: 1.0
+  t_min: 0.0
+  t_max: 1.0
+  n_x: 256                      # dense grid for saved field (plots)
+  n_t: 128
+
+# ---------------------------
+# PINN architecture
+# ---------------------------
+model:
+  hidden: [64, 64, 64]          # MLP with tanh activations (see diffusion1d.py)
+  activation: tanh
+
+# ---------------------------
+# Training hyperparameters
+# ---------------------------
+# NOTE: `training` and `optim` are intentionally aliased so that CLI overrides like
+#   --set training.epochs=50
+# also propagate to optim.* (for backwards-compatibility with earlier demo notes).
+training: &TRAINING
+  lr: 2.0e-3
+  epochs: 800
+  batch: 4096                   # interior collocation points per epoch
+  weight_decay: 0.0
+  n_boundary: 512               # boundary samples per epoch
+  n_initial: 512                # initial-condition samples per epoch
+  sample_method: sobol          # "sobol" (recommended) or "uniform"
+
+optim: *TRAINING
+
+# ---------------------------
+# Differentiable STL monitoring + penalty (λ = stl.weight)
+# ---------------------------
+stl:
+  use: true
+
+  # λ (regularization strength): larger => prioritize satisfying φ_bound more strongly
+  weight: 5.0
+
+  # φ_bound parameter:  max_x u(x,t) ≤ U_max  (ideally for all t in [0,1])
+  u_max: 1.05                   # choose slightly above the true IC peak (=1.0) to avoid trivial conflict at t=0
+
+  # Temperature for soft aggregators:
+  #   • spatial softmax approximates max_x
+  #   • temporal soft-min approximates G (min over time of predicate margins)
+  temp: 0.1
+
+  # Spatial reduction across x: "mean" | "softmax" | "amax"
+  # softmax is differentiable and approximates max_x as temp → 0
+  spatial: softmax
+
+  # Monitoring cadence + discretization grid for (x,t) when evaluating robustness
+  every: 1                      # compute robustness each epoch (gives smooth robustness curves)
+  n_x: 128                      # x samples for monitoring/max_x approximation
+  n_t: 128                      # t samples for monitoring/G approximation
+
+  # Documentation-only convenience: RTAMT-ready specs to evaluate on saved fields
+  # (scripts/eval_diffusion_rtamt.py expects a scalar time series s(t)).
+  eval_specs:
+    bound_safety:
+      description: "Safety: peak temperature never exceeds U_max over the horizon."
+      # Note: use --agg amax so s(t)=max_x u(x,t)
+      rtamt: "always[0,1](s <= 1.05)"
+      agg: amax
+
+    # Example “eventually” (liveness-style) cooling specs.
+    # For α=0.1 and horizon [0,1], the true peak decays to exp(-0.1π²)≈0.373 at t=1.
+    # These are useful to show both satisfaction and falsification cases.
+    eventually_cool_ok:
+      description: "Cooling (should be satisfiable): by late time, peak temp drops below 0.40."
+      rtamt: "eventually[0.8,1](s <= 0.40)"
+      agg: amax
+    eventually_cool_strict:
+      description: "Cooling (likely falsified on [0,1]): by late time, peak temp drops below 0.30."
+      rtamt: "eventually[0.8,1](s <= 0.30)"
+      agg: amax
+
+# ---------------------------
+# System / runtime knobs
+# ---------------------------
+device: null                    # null => auto (cuda -> mps -> cpu)
+dtype: float32
+amp: false                      # AMP off by default for PINN stability
+compile: false                  # torch.compile off for portability
+print_every: 25
+
+# ---------------------------
+# Output / artifacts
+# ---------------------------
+io:
+  results_dir: results          # diffusion1d_<tag>*.{csv,pt} saved here
+  save_ckpt: true
+
+# ---------------------------------------------------------------------------
+# Suggested ablations (manual, to avoid filename collisions)
+# ---------------------------------------------------------------------------
+# For the report, it’s useful to run a few λ values and compare:
+#
+#   python scripts/run_experiment.py -c configs/diffusion1d_stl.yaml --set tag=stl_w0  --set stl.weight=0
+#   python scripts/run_experiment.py -c configs/diffusion1d_stl.yaml --set tag=stl_w2  --set stl.weight=2
+#   python scripts/run_experiment.py -c configs/diffusion1d_stl.yaml --set tag=stl_w5  --set stl.weight=5
+#
+# Then evaluate extra RTAMT specs on the saved field:
+#   python scripts/eval_diffusion_rtamt.py --field results/diffusion1d_stl_w5_field.pt --agg amax
+#

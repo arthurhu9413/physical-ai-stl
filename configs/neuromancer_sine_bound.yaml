@@ -1,0 +1,202 @@
+# =============================================================================
+# Neuromancer (toy) — sine regression + STL monitoring/regularization (CPU-first)
+# =============================================================================
+#
+# This config is meant to be *report-ready*: it states (1) what the example is,
+# (2) what specifications are being monitored/used in training, and (3) what
+# artifacts you should produce for slides/report (plots + JSON metrics).
+#
+# Why keep this toy example?
+#   - It is the simplest “physical-AI-ish” demonstration of the full pipeline:
+#       data → model → (soft) STL penalty in training → robustness monitoring.
+#   - It is small enough to run live on CPU in < 1 minute.
+#
+# ---------------------------------------------------------------------------
+# High-level dataflow (one slide friendly)
+# ---------------------------------------------------------------------------
+#
+#   (generate t, y_true=sin(t))            (define STL specs)
+#                 |                              |
+#                 v                              v
+#           Neural model f_θ(t)          φ_safe, φ_perf, ...
+#                 |                              |
+#                 +-----------+------------------+
+#                             v
+#            Training objective:  L = MSE(y_hat,y_true) + λ·L_STL(φ_safe, y_hat)
+#                             |
+#                             v
+#                 trained parameters θ*
+#                             |
+#                             v
+#        offline monitoring (RTAMT) → robustness ρ(φ, y_hat), pass/fail + plots
+#
+# Notes:
+#   - λ is the scalar “STL weight” (called stl_weight below).
+#   - In this toy, “spatial” is degenerate (1D time); spatial STL/STREL is shown
+#     in the 2D heat configs/experiments. This file focuses on crisp STL writing.
+#
+# ---------------------------------------------------------------------------
+# Recommended runs (baseline vs STL-regularized)
+# ---------------------------------------------------------------------------
+#
+# 1) Baseline (no STL penalty): stl_weight = 0
+# 2) STL-regularized:          stl_weight > 0  (e.g., 10–300)
+#
+# For report/slide figures, produce at least:
+#   - time-series plot: y_true(t), y_hat(t), and the safety bound line
+#   - scalar summary table: {MSE, max_violation, min_robustness, RTAMT_robustness}
+#   - (optional) a λ sweep plot: λ vs MSE and λ vs max_violation
+#
+# ---------------------------------------------------------------------------
+# Core experiment parameters (mirrors scripts/train_neuromancer_stl.py flags)
+# ---------------------------------------------------------------------------
+
+# Generated dataset size (samples of t over one period)
+n: 256
+
+# Optimization hyperparameters (CPU-friendly defaults)
+epochs: 200
+lr: 1.0e-3
+seed: 7
+device: cpu
+
+# Safety bound used by φ_safe (see spec section)
+bound: 0.80
+
+# λ: scales the soft STL penalty inside the loss.
+#   - λ = 0   → pure regression baseline
+#   - λ > 0   → trades accuracy for safety (reduced bound violations)
+stl_weight: 100.0
+
+# If true, also runs the (optional) Neuromancer training path in addition to the
+# plain PyTorch path. If Neuromancer is not installed, the script should fall
+# back gracefully.
+run_neuromancer: true
+
+# If true, compute an independent RTAMT robustness number for φ_safe.
+# (RTAMT must be installed; otherwise this will be skipped.)
+rtamt: true
+
+# Pretty-print JSON metrics to stdout (useful for live demos)
+pretty: true
+
+# Reduce console noise (set true for batch sweeps; false for live demo)
+quiet: false
+
+# ---------------------------------------------------------------------------
+# Specifications (write these out in the paper!)
+# ---------------------------------------------------------------------------
+# Conventions:
+#   - y_hat(t) is the model output (prediction)
+#   - Time horizon is the finite trace length of the generated dataset.
+#   - Robustness is in the standard quantitative STL sense: ρ>0 satisfies.
+#
+# IMPORTANT: Only φ_safe is used for training (soft penalty) in this toy script.
+# The other specs are included to (a) demonstrate “eventually” patterns and (b)
+# encourage good reporting practice (monitor multiple specs).
+#
+#  φ_safe  (safety; TRAIN + MONITOR)
+#    Math:     φ_safe := G ( y_hat(t) ≤ bound )
+#    Robust:   ρ(φ_safe) = min_t ( bound - y_hat(t) )
+#    Violation = max(0, max_t y_hat(t) - bound)
+#
+#  φ_event (eventually; MONITOR ONLY)
+#    Intuition: the oscillator should *eventually* go below a target level.
+#    Math:       φ_event := F ( y_hat(t) ≤ y_eventual )
+#
+#  φ_reach (eventually; MONITOR ONLY)
+#    Intuition: the signal should *eventually* reach (or exceed) a minimum peak.
+#    Math:       φ_reach := F ( y_hat(t) ≥ y_peak_min )
+#
+# RTAMT syntax examples:
+#   φ_safe  :  always (u <= 0.8)
+#   φ_event :  eventually (u <= -0.5)
+#   φ_reach :  eventually (u >= 0.7)
+#
+specs:
+  safe_upper_bound:
+    name: "φ_safe = G (y_hat <= bound)"
+    role: ["train", "monitor"]
+    stl_math: "G ( y_hat(t) <= bound )"
+    rtamt: "always (u <= {bound})"
+    params:
+      bound: 0.80
+
+  eventually_below:
+    name: "φ_event = F (y_hat <= y_eventual)"
+    role: ["monitor"]
+    stl_math: "F ( y_hat(t) <= y_eventual )"
+    rtamt: "eventually (u <= {y_eventual})"
+    params:
+      y_eventual: -0.50
+
+  eventually_reach_peak:
+    name: "φ_reach = F (y_hat >= y_peak_min)"
+    role: ["monitor"]
+    stl_math: "F ( y_hat(t) >= y_peak_min )"
+    rtamt: "eventually (u >= {y_peak_min})"
+    params:
+      y_peak_min: 0.70
+
+# ---------------------------------------------------------------------------
+# Output artifacts (for report reproducibility + demo)
+# ---------------------------------------------------------------------------
+io:
+  # Where to save the JSON output from scripts/train_neuromancer_stl.py
+  # (Contains config + environment info + summary metrics for torch/neuromancer.)
+  out: "runs/neuromancer_sine_bound/latest.json"
+
+  # Optional: save trained torch weights (lets you reproduce plots later)
+  save_model: "runs/neuromancer_sine_bound/latest.pt"
+
+  # Suggested locations for figures/tables you will include in slides/paper.
+  # (The training script does not auto-generate plots; see commands below.)
+  fig_dir: "figs/neuromancer_sine_bound/"
+  table_dir: "tables/neuromancer_sine_bound/"
+
+# ---------------------------------------------------------------------------
+# Copy/paste commands (canonical, demo-friendly)
+# ---------------------------------------------------------------------------
+commands:
+
+  # Baseline: no STL penalty
+  baseline: |-
+    python scripts/train_neuromancer_stl.py \
+      --n 256 --epochs 200 --lr 1e-3 \
+      --bound 0.8 --stl-weight 0 \
+      --seed 7 --device cpu \
+      --rtamt --pretty \
+      --out runs/neuromancer_sine_bound/baseline.json \
+      --save-model runs/neuromancer_sine_bound/baseline.pt
+
+  # STL-regularized run (λ = 100 by default)
+  stl_regularized: |-
+    python scripts/train_neuromancer_stl.py \
+      --n 256 --epochs 200 --lr 1e-3 \
+      --bound 0.8 --stl-weight 100 \
+      --seed 7 --device cpu \
+      --rtamt --pretty \
+      --out runs/neuromancer_sine_bound/stl_w100.json \
+      --save-model runs/neuromancer_sine_bound/stl_w100.pt
+
+  # Quick λ sweep (shell loop; produces a small ablation table for the report)
+  lambda_sweep: |-
+    for LAMBDA in 0 1 10 30 100 300; do \
+      python scripts/train_neuromancer_stl.py \
+        --n 256 --epochs 200 --lr 1e-3 \
+        --bound 0.8 --stl-weight $LAMBDA \
+        --seed 7 --device cpu \
+        --rtamt --quiet \
+        --out runs/neuromancer_sine_bound/sweep_w${LAMBDA}.json ; \
+    done
+
+# ---------------------------------------------------------------------------
+# Reporting checklist (to copy into the paper)
+# ---------------------------------------------------------------------------
+reporting:
+  include_in_paper:
+    - "Write φ_safe, φ_event, φ_reach explicitly (math + parameter values)."
+    - "Include at least one time-series plot (y_true, y_hat, bound line)."
+    - "Report MSE + max violation + min robustness + RTAMT robustness (if used)."
+    - "Record hardware/software via scripts/check_env.py (CPU/GPU/RAM, torch)."
+    - "If comparing λ values, include the λ sweep table/plot."
